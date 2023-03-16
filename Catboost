@@ -1,0 +1,138 @@
+import pandas as pd
+import numpy as np
+from matplotlib import pyplot as plt
+from sklearn.linear_model import LogisticRegression, LogisticRegressionCV, LinearRegression
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.compose import make_column_transformer
+from sklearn.preprocessing import StandardScaler, RobustScaler, LabelEncoder, OneHotEncoder
+from sklearn.pipeline import make_pipeline 
+!pip3 install catboost
+from catboost import CatBoostRegressor
+
+from openpyxl import load_workbook
+from pathlib import Path
+import itertools as it
+
+# Convert №s to ID
+
+ws = load_workbook(Path('market-coordinates.xlsx'))['Sheet1']
+address_to_id = {}
+for i, row in it.islice(enumerate(ws.rows), 1, 1000):
+    address_to_id[row[1].value] = int(row[0].value)
+    
+ws = load_workbook(Path('filled-table.xlsx'), read_only=True)['Sheet']
+
+market_address_ids = []
+market_visitor_frequencies = []
+
+for i, row in it.islice(enumerate(ws.rows), 229):
+    address = ' '.join([str(row[i].value) for i in [4, 3, 2]])
+    #print(address)
+    market_address_ids.append([row[0].value, address_to_id[address]])
+    
+    visitors = int(row[14].value)
+    try:
+        days = int(row[15].value)
+    except TypeError:
+        days = 30
+    market_visitor_frequencies.append(visitors / days)
+
+#print(market_address_ids)
+#print(len(market_address_ids))
+market_address_ids = np.array(market_address_ids)
+market_visitor_frequencies = np.array(market_visitor_frequencies)
+
+# CSV reading
+
+main_data = pd.read_csv('./main_data_4.csv')
+
+id = []
+i, j = 0, 0
+while i < 180:
+  while j < 229:
+    if (main_data['Num'][i] == market_address_ids[j][0]):
+      id.append(market_address_ids[j][1])
+      break
+    j += 1
+  i += 1
+#print(id)
+#print(len(id))
+
+dists = pd.read_csv('./fixed_dist.csv')
+#dists.head()
+
+# Preprocessing tools
+
+def to_flt(s):
+  if type(s) != type('help'):
+    return s
+  s = s.replace(' ', '')
+  s = s.replace('\xa0', '')
+  s = s.split(',')
+  s = '.'.join(s)
+  return float(s)
+
+def prob_counter(lamb, i, j): # i - номер района, j - номер магазина (порядковый, не ID !!!)
+  sum = 0
+  for v in range(180):
+    sum += to_flt(main_data['Square'][v]) / to_flt((dists[ ('Store' + str(main_data['ID'][v]) )][i - 1]))**lamb
+  return (dists['Population'][i - 1]) * to_flt(main_data['Square'][j - 1]) / to_flt((dists[ ('Store' + str(main_data['ID'][j - 1]) )][i - 1]))**lamb / sum
+  
+main_data.insert(7, 'Huff_predict', list(i for i in range(180)))
+#main_data.head()
+
+# Huff model
+
+def huff_predict(i, lamb):
+  sum = 0
+  for j in range(112):
+    sum += prob_counter(lamb, j + 1, i + 1)
+  return sum
+  
+# Creating model
+
+cat_cols  = ['Type', 'Name', 'Building']
+num_cols = ['Square', 'Huff_predict']
+target_col = 'FPD'
+
+lamb = 0.7
+for i in range(180):
+  main_data['Huff_predict'][i] = huff_predict(i, lamb)
+  main_data['Square'][i] = to_flt(main_data['Square'][i]) 
+#main_data.head()
+
+X = main_data.drop(target_col, axis = 1)
+X = X.drop('Num', axis = 1)
+X = X.drop('ID', axis = 1)
+#X = X.drop('Square', axis = 1)
+X = X.drop('Freqs', axis = 1)
+X = X.drop('Period', axis = 1)
+#X = X.drop('Building', axis = 1)
+#X = X.drop('Type', axis = 1)
+X.head()
+
+Y = main_data[target_col]
+for i in range(len(Y)):
+  Y[i] = to_flt(Y[i])
+Y.head()
+
+# Fit model
+
+from sklearn.metrics import mean_absolute_percentage_error
+from sklearn.model_selection import StratifiedKFold
+
+
+X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size = 0.2)
+
+#создаем пробную модель с default-параметрами
+gb_proba = CatBoostRegressor(depth = 15, num_trees = 100, learning_rate = 0.4, eval_metric='MAPE')
+
+gb_proba.fit(X_train, Y_train, cat_features=cat_cols, eval_set=(X_test, Y_test))
+
+
+# Checking quality
+
+Y_predict = gb_proba.predict(X)
+Y_pred = gb_proba.predict(X_test)
+print(mean_absolute_percentage_error(Y, Y_predict))
+print(mean_absolute_percentage_error(Y_test, Y_pred))
